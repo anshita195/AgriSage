@@ -37,6 +37,38 @@ class DataGovInAPIFetcher:
         self.target_states = ['Uttarakhand', 'Uttar Pradesh', 'Punjab', 'Haryana']
         self.target_districts = ['Dehradun', 'Haridwar', 'Roorkee', 'Rishikesh', 'Pauri Garhwal']
         
+        # Region-aware fallback mapping: state -> [immediate neighbors, nearby states, wider region]
+        self.regional_fallback = {
+            'uttarakhand': {
+                'immediate': ['uttar pradesh', 'himachal pradesh'],
+                'nearby': ['haryana', 'punjab', 'delhi'],
+                'regional': ['rajasthan', 'bihar', 'jharkhand'],
+                'distant': ['madhya pradesh', 'chhattisgarh', 'west bengal'],
+                'national': ['gujarat', 'maharashtra', 'karnataka', 'andhra pradesh']
+            },
+            'uttar pradesh': {
+                'immediate': ['uttarakhand', 'bihar', 'madhya pradesh'],
+                'nearby': ['haryana', 'delhi', 'rajasthan'],
+                'regional': ['punjab', 'jharkhand', 'chhattisgarh'],
+                'distant': ['west bengal', 'himachal pradesh'],
+                'national': ['gujarat', 'maharashtra', 'karnataka']
+            },
+            'haryana': {
+                'immediate': ['punjab', 'delhi', 'uttar pradesh'],
+                'nearby': ['uttarakhand', 'rajasthan', 'himachal pradesh'],
+                'regional': ['madhya pradesh', 'bihar'],
+                'distant': ['gujarat', 'jharkhand'],
+                'national': ['maharashtra', 'karnataka', 'west bengal']
+            },
+            'punjab': {
+                'immediate': ['haryana', 'himachal pradesh'],
+                'nearby': ['delhi', 'uttarakhand', 'rajasthan'],
+                'regional': ['uttar pradesh', 'jammu and kashmir'],
+                'distant': ['madhya pradesh', 'gujarat'],
+                'national': ['maharashtra', 'karnataka', 'bihar']
+            }
+        }
+        
         # Commodity name mapping for query normalization (with Hindi synonyms)
         self.commodity_map = {
             'rice': ['Rice', 'Paddy(Dhan)', 'Paddy', 'Basmati', 'Non-Basmati', 'धान', 'चावल'],
@@ -326,136 +358,40 @@ class DataGovInAPIFetcher:
             commodity_hindi = self._get_hindi_name(result['commodity'])
             hindi_suffix = f" ({commodity_hindi})" if commodity_hindi else ""
             
-            if tier == 'nearby':
-                response += f"ℹ️ Using nearby {result['state']} data (most similar to Uttarakhand){hindi_suffix}"
-            elif tier == 'neighboring':
-                response += f"ℹ️ Using neighboring {result['state']} data for reference{hindi_suffix}"
+            if tier == 'immediate':
+                response += f"ℹ️ Using neighboring {result['state']} data (shares border with Uttarakhand){hindi_suffix}"
+            elif tier == 'nearby':
+                response += f"ℹ️ Using nearby {result['state']} data (similar climate zone){hindi_suffix}"
             elif tier == 'regional':
                 response += f"ℹ️ Using regional {result['state']} data for comparison{hindi_suffix}"
             elif tier == 'distant':
                 response += f"ℹ️ Using distant {result['state']} data (limited local availability){hindi_suffix}"
-            else:
+            elif tier == 'national':
                 response += f"ℹ️ Using national benchmark from {result['state']}{hindi_suffix}"
+            else:
+                response += f"ℹ️ Using available data from {result['state']}{hindi_suffix}"
             
             return response
         
         else:  # fuzzy match
             return f"✅ {result['commodity']} ({result['variety']}) in {result['district']}: {price_display} at {result['mandi']} ({date_display})"
     
-    def _get_commodity_variants(self, commodity: str) -> List[str]:
-        """Get all possible variants of a commodity name"""
-        commodity_lower = commodity.lower()
-        
-        # Check if commodity matches any key in our mapping
-        for key, variants in self.commodity_map.items():
-            if key in commodity_lower or commodity_lower in key:
-                return variants
-        
-        # If no mapping found, return original with some common variations
-        return [commodity, commodity.capitalize(), commodity.upper()]
-    
-    def _get_hindi_name(self, commodity: str) -> str:
-        """Get Hindi name for commodity if available"""
-        commodity_lower = commodity.lower()
-        
-        hindi_map = {
-            'rice': 'चावल', 'paddy': 'धान', 'wheat': 'गेहूं',
-            'mustard': 'सरसों', 'maize': 'मक्का', 'corn': 'मक्का',
-            'sugarcane': 'गन्ना', 'cotton': 'कपास', 'onion': 'प्याज',
-            'potato': 'आलू', 'tomato': 'टमाटर'
-        }
-        
-        for eng, hindi in hindi_map.items():
-            if eng in commodity_lower:
-                return hindi
-        
-        return ""
-    
-    def _get_location_variants(self, location: str) -> List[str]:
-        """Get all possible variants of a location name"""
-        if not location:
-            return []
-        
-        location_lower = location.lower()
-        
-        # Check if location matches any key in our mapping
-        for key, variants in self.location_map.items():
-            if key in location_lower or location_lower in key:
-                return variants
-        
-        # If no mapping found, return original with variations
-        return [location, location.capitalize(), location.upper()]
-    
-    def _query_with_variants(self, cursor, commodity_variants: List[str], location_variants: List[str], exact: bool = True) -> Optional[Dict]:
-        """Query database with commodity and location variants"""
-        # Build dynamic query based on variants
-        commodity_conditions = []
-        params = []
-        
-        for variant in commodity_variants:
-            if exact:
-                commodity_conditions.append("LOWER(commodity) = ?")
-                params.append(variant.lower())
-            else:
-                commodity_conditions.append("LOWER(commodity) LIKE ?")
-                params.append(f"%{variant.lower()}%")
-        
-        query = f"""
-            SELECT commodity, district, mandi, price, variety, date, source
-            FROM real_mandi_prices 
-            WHERE ({' OR '.join(commodity_conditions)})
-        """
-        
-        # Add location conditions if specified
-        if location_variants:
-            location_conditions = []
-            for variant in location_variants:
-                if exact:
-                    location_conditions.extend([
-                        "LOWER(district) = ?",
-                        "LOWER(mandi) = ?"
-                    ])
-                    params.extend([variant.lower(), variant.lower()])
-                else:
-                    location_conditions.extend([
-                        "LOWER(district) LIKE ?",
-                        "LOWER(mandi) LIKE ?"
-                    ])
-                    params.extend([f"%{variant.lower()}%", f"%{variant.lower()}%"])
-            
-            query += f" AND ({' OR '.join(location_conditions)})"
-        
-        query += " ORDER BY date DESC, price DESC LIMIT 5"
-        
-        cursor.execute(query, params)
-        results = cursor.fetchall()
-        
-        if results:
-            commodity, district, mandi, price, variety, date, source = results[0]
-            return {
-                'commodity': commodity,
-                'district': district,
-                'mandi': mandi,
-                'price': price,
-                'variety': variety,
-                'date': date,
-                'source': source,
-                'alternatives': len(results) - 1,
-                'match_type': 'exact' if exact else 'fuzzy'
-            }
-        
-        return None
-    
     def _query_with_fallback_states(self, cursor, commodity_variants: List[str]) -> Optional[Dict]:
-        """Query with cascading fallback: neighbors → national"""
-        # Try neighboring states first (prioritized by proximity to Uttarakhand)
+        """Query with region-aware cascading fallback based on geographic proximity"""
+        # Determine primary state context (default to Uttarakhand for AgriSage)
+        primary_state = 'uttarakhand'
+        
+        # Get region-aware fallback tiers
+        fallback_config = self.regional_fallback.get(primary_state, self.regional_fallback['uttarakhand'])
+        
+        # Build cascading fallback tiers with geographic logic
         fallback_tiers = [
-            (['Uttar Pradesh'], 'nearby'),
-            (['Haryana'], 'nearby'),
-            (['Punjab', 'Himachal Pradesh'], 'neighboring'),
-            (['Madhya Pradesh', 'Rajasthan'], 'regional'),
-            (['Gujarat', 'Maharashtra'], 'distant'),
-            ([], 'national')  # Empty list means any state
+            (fallback_config['immediate'], 'immediate'),
+            (fallback_config['nearby'], 'nearby'), 
+            (fallback_config['regional'], 'regional'),
+            (fallback_config['distant'], 'distant'),
+            (fallback_config['national'], 'national'),
+            ([], 'any_state')  # Final fallback to any available state
         ]
         
         for states, tier_name in fallback_tiers:
@@ -489,11 +425,12 @@ class DataGovInAPIFetcher:
                 commodity, district, mandi, price, variety, date, source, state = results[0]
                 
                 note_map = {
-                    'nearby': f'No local data found, showing price from nearby {state}',
-                    'neighboring': f'No local data found, showing price from neighboring {state}',
+                    'immediate': f'No local data found, showing price from neighboring {state}',
+                    'nearby': f'No local data found, showing price from nearby {state}', 
                     'regional': f'No local data found, showing price from regional market {state}',
                     'distant': f'No local data found, showing price from distant market {state}',
-                    'national': f'Using national benchmark from {state}'
+                    'national': f'Using national benchmark from {state}',
+                    'any_state': f'Using available data from {state}'
                 }
                 
                 return {
@@ -552,15 +489,16 @@ def main():
             print(f"  {commodity} in {state}: {count} records")
         conn.close()
         
-        # Test enhanced query functionality
-        print(f"\n🔍 Testing enhanced price queries:")
+        # Test enhanced query functionality with region-aware fallback
+        print(f"\n🔍 Testing region-aware price queries:")
         test_queries = [
             ('rice', 'roorkee'),
-            ('wheat', 'dehradun'),
+            ('wheat', 'dehradun'), 
             ('mustard', 'uttarakhand'),
             ('paddy', 'haridwar'),  # Test commodity mapping
             ('sarson', None),       # Test without location
-            ('maize', 'uk')         # Test location mapping
+            ('maize', 'uk'),        # Test location mapping
+            ('cotton', 'uttarakhand')  # Test distant fallback
         ]
         
         for commodity, location in test_queries:
