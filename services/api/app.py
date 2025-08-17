@@ -14,9 +14,21 @@ import json
 from typing import Optional, List, Dict
 import sqlite3
 from dotenv import load_dotenv
+import logging
+from datetime import datetime
+import uuid
+import re
 
 # Load environment variables
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# LLM request logging
+LLM_LOG_FILE = Path("logs/llm_requests.jsonl")
+LLM_LOG_FILE.parent.mkdir(exist_ok=True)
 
 # Import fallback rules
 import sys
@@ -123,12 +135,82 @@ def get_context_from_db(location: str = None) -> Dict:
     
     return context
 
-def retrieve_documents(query: str, k: int = 5) -> tuple:
-    """Retrieve relevant documents from vector database"""
+def get_query_intent(query: str) -> Dict[str, float]:
+    """Classify query intent and extract keywords"""
+    query_lower = query.lower()
+    
+    # Intent keywords with weights
+    intent_patterns = {
+        'irrigation': ['irrigat', 'water', 'watering', 'moisture', 'dry', 'wet'],
+        'weather': ['weather', 'rain', 'temperature', 'forecast', 'climate'],
+        'soil': ['soil', 'ph', 'nitrogen', 'phosphorus', 'potassium', 'nutrient'],
+        'market': ['price', 'market', 'sell', 'buy', 'mandi', 'cost'],
+        'fertilizer': ['fertiliz', 'nutrient', 'npk', 'urea', 'compost'],
+        'pest': ['pest', 'insect', 'disease', 'spray', 'chemical']
+    }
+    
+    intent_scores = {}
+    for intent, keywords in intent_patterns.items():
+        score = sum(1 for keyword in keywords if keyword in query_lower)
+        if score > 0:
+            intent_scores[intent] = score / len(keywords)
+    
+    return intent_scores
+
+def filter_by_metadata(documents: List[str], metadatas: List[Dict], query: str, location: str = None) -> tuple:
+    """Filter documents by metadata relevance"""
+    intent_scores = get_query_intent(query)
+    
+    if not intent_scores:
+        return documents, metadatas, [1.0] * len(documents)
+    
+    # Get primary intent
+    primary_intent = max(intent_scores.keys(), key=lambda k: intent_scores[k])
+    
+    # Type mapping for filtering
+    intent_to_type = {
+        'irrigation': ['weather', 'soil'],
+        'weather': ['weather'],
+        'soil': ['soil'],
+        'market': ['market', 'trade'],
+        'fertilizer': ['soil'],
+        'pest': ['weather', 'soil']
+    }
+    
+    relevant_types = intent_to_type.get(primary_intent, [])
+    
+    filtered_docs = []
+    filtered_metas = []
+    relevance_scores = []
+    
+    for doc, meta in zip(documents, metadatas):
+        base_score = 0.5  # Base relevance
+        
+        # Type relevance boost
+        if meta.get('type') in relevant_types:
+            base_score += 0.4
+        
+        # Location relevance boost
+        if location and meta.get('district', '').lower() == location.lower():
+            base_score += 0.3
+        elif location and location.lower() in meta.get('district', '').lower():
+            base_score += 0.2
+        
+        # Only keep documents with reasonable relevance
+        if base_score >= 0.6:
+            filtered_docs.append(doc)
+            filtered_metas.append(meta)
+            relevance_scores.append(base_score)
+    
+    return filtered_docs, filtered_metas, relevance_scores
+
+def retrieve_documents(query: str, k: int = 5, location: str = None) -> tuple:
+    """Hybrid retrieval: vector similarity + metadata filtering + reranking"""
     try:
+        # Get more candidates from vector search
         results = collection.query(
             query_texts=[query],
-            n_results=k,
+            n_results=min(k * 3, 15),  # Get 3x more candidates
             include=["documents", "metadatas", "distances"]
         )
         
@@ -136,22 +218,67 @@ def retrieve_documents(query: str, k: int = 5) -> tuple:
         metadatas = results['metadatas'][0] 
         distances = results['distances'][0]
         
-        # Calculate retrieval score (lower distance = higher score)
-        max_distance = max(distances) if distances else 1.0
-        retrieval_scores = [(max_distance - d) / max_distance for d in distances]
-        avg_retrieval_score = sum(retrieval_scores) / len(retrieval_scores) if retrieval_scores else 0.0
+        if not documents:
+            return [], [], 0.0
         
-        return documents, metadatas, avg_retrieval_score
+        # Apply metadata filtering
+        filtered_docs, filtered_metas, relevance_scores = filter_by_metadata(
+            documents, metadatas, query, location
+        )
+        
+        if not filtered_docs:
+            # If no filtered results, use top vector results but with lower confidence
+            logger.warning(f"No metadata-filtered results for query: {query}")
+            top_docs = documents[:k]
+            top_metas = metadatas[:k]
+            # Lower confidence for non-filtered results
+            avg_score = 0.3
+            return top_docs, top_metas, avg_score
+        
+        # Take top k filtered results
+        final_docs = filtered_docs[:k]
+        final_metas = filtered_metas[:k]
+        final_scores = relevance_scores[:k]
+        
+        # Calculate average relevance score
+        avg_retrieval_score = sum(final_scores) / len(final_scores) if final_scores else 0.0
+        
+        logger.info(f"Retrieved {len(final_docs)} filtered documents, avg score: {avg_retrieval_score:.3f}")
+        return final_docs, final_metas, avg_retrieval_score
         
     except Exception as e:
-        print(f"Error retrieving documents: {e}")
+        logger.error(f"Error retrieving documents: {e}")
         return [], [], 0.0
+
+def log_llm_request(request_id: str, prompt: str, response: dict, status_code: int, latency: float, error: str = None):
+    """Log LLM request for debugging and monitoring"""
+    try:
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "request_id": request_id,
+            "model": "gemini-1.5-flash",
+            "prompt_length": len(prompt),
+            "status_code": status_code,
+            "latency_ms": round(latency * 1000, 2),
+            "success": status_code == 200,
+            "error": error,
+            "response_tokens": response.get("usageMetadata", {}).get("totalTokenCount", 0) if response else 0
+        }
+        
+        with open(LLM_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry) + "\n")
+            
+    except Exception as e:
+        logger.error(f"Failed to log LLM request: {e}")
 
 def call_gemini_llm(prompt: str) -> tuple:
     """Call Google Gemini LLM and return response with confidence"""
+    request_id = str(uuid.uuid4())[:8]
+    start_time = datetime.now()
+    
     try:
         if not gemini_api_key:
-            print("Gemini API key not available")
+            logger.warning("Gemini API key not available")
             return None, 0.0
         
         # Gemini API endpoint - using gemini-1.5-flash (current available model)
@@ -176,9 +303,12 @@ def call_gemini_llm(prompt: str) -> tuple:
         }
         
         response = requests.post(url, headers=headers, json=data, timeout=30)
+        latency = (datetime.now() - start_time).total_seconds()
         
         if response.status_code == 200:
             result = response.json()
+            log_llm_request(request_id, prompt, result, response.status_code, latency)
+            
             if 'candidates' in result and len(result['candidates']) > 0:
                 answer = result['candidates'][0]['content']['parts'][0]['text'].strip()
                 
@@ -193,16 +323,23 @@ def call_gemini_llm(prompt: str) -> tuple:
                     except:
                         pass
                 
+                logger.info(f"LLM success [{request_id}]: {latency*1000:.0f}ms, confidence: {llm_confidence}")
                 return answer, llm_confidence
             else:
-                print("No candidates in Gemini response")
+                logger.warning(f"No candidates in Gemini response [{request_id}]")
+                log_llm_request(request_id, prompt, result, response.status_code, latency, "No candidates")
                 return None, 0.0
         else:
-            print(f"Gemini API error: {response.status_code} - {response.text}")
+            error_msg = f"HTTP {response.status_code}: {response.text}"
+            logger.error(f"Gemini API error [{request_id}]: {error_msg}")
+            log_llm_request(request_id, prompt, {}, response.status_code, latency, error_msg)
             return None, 0.0
         
     except Exception as e:
-        print(f"Error calling Gemini LLM: {e}")
+        latency = (datetime.now() - start_time).total_seconds()
+        error_msg = str(e)
+        logger.error(f"Error calling Gemini LLM [{request_id}]: {error_msg}")
+        log_llm_request(request_id, prompt, {}, 0, latency, error_msg)
         return None, 0.0
 
 @app.post("/ask", response_model=QueryResponse)
@@ -220,7 +357,7 @@ async def ask_question(request: QueryRequest):
     
     try:
         # Retrieve relevant documents
-        documents, metadatas, retrieval_score = retrieve_documents(request.question)
+        documents, metadatas, retrieval_score = retrieve_documents(request.question, location=request.location)
         
         if not documents:
             # Use fallback rules if no documents found
