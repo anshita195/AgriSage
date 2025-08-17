@@ -7,30 +7,61 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 from pathlib import Path
 import json
+import pandas as pd
 
 def load_data_from_db():
     """Load data from SQLite database for indexing"""
     db_path = Path("data/agri.db")
     if not db_path.exists():
         raise FileNotFoundError("Database not found. Run ETL first: python services/ingestion/etl_imd.py")
+    # Load data from database (prioritize reliable sources)
+    conn = sqlite3.connect('data/agrisage.db')
     
-    conn = sqlite3.connect(db_path)
+    # Try reliable data first, fallback to original tables
+    try:
+        weather_df = pd.read_sql_query("SELECT * FROM reliable_weather", conn)
+        print(f"✅ Using reliable weather data: {len(weather_df)} records")
+    except:
+        weather_df = pd.read_sql_query("SELECT * FROM weather_forecast", conn)
+        print(f"⚠️ Using fallback weather data: {len(weather_df)} records")
+    
+    try:
+        soil_df = pd.read_sql_query("SELECT * FROM reliable_soil", conn)
+        print(f"✅ Using reliable soil data: {len(soil_df)} records")
+    except:
+        soil_df = pd.read_sql_query("SELECT * FROM soil_card", conn)
+        print(f"⚠️ Using fallback soil data: {len(soil_df)} records")
+    
+    try:
+        market_df = pd.read_sql_query("SELECT * FROM reliable_markets", conn)
+        print(f"✅ Using reliable market data: {len(market_df)} records")
+    except:
+        market_df = pd.read_sql_query("SELECT * FROM market_prices", conn)
+        print(f"⚠️ Using fallback market data: {len(market_df)} records")
+    
     documents = []
     metadatas = []
     ids = []
     
-    # Weather forecast data
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, district, forecast_date, precip_prob, max_temp, min_temp 
-        FROM weather_forecast
-    """)
-    for row in cursor.fetchall():
-        doc_id, district, date, precip, max_temp, min_temp = row
+    # Weather forecast data (handle both reliable and fallback schemas)
+    for index, row in weather_df.iterrows():
+        doc_id = row.get('id', index)
+        district = row['district']
+        date = row.get('date', row.get('forecast_date', 'unknown'))
+        precip = row.get('precip_prob', 0)
+        max_temp = row.get('max_temp', 25)
+        min_temp = row.get('min_temp', 15)
+        source = row.get('source', 'weather_forecast')
+        
         text = f"Weather forecast for {district} on {date}: {precip}% chance of precipitation, max temp {max_temp}°C, min temp {min_temp}°C"
+        if 'description' in row and row['description']:
+            text += f", conditions: {row['description']}"
+        if 'rainfall' in row and row['rainfall']:
+            text += f", rainfall: {row['rainfall']}mm"
+            
         documents.append(text)
         metadatas.append({
-            "source": "weather_forecast",
+            "source": source,
             "row_id": str(doc_id),
             "district": district,
             "date": date,
@@ -38,44 +69,60 @@ def load_data_from_db():
         })
         ids.append(f"weather_{doc_id}")
     
-    # Soil health data
-    cursor.execute("""
-        SELECT id, farmer_id, village, district, pH, N, P, K, organic_carbon, soil_moisture 
-        FROM soil_card
-    """)
-    for row in cursor.fetchall():
-        doc_id, farmer_id, village, district, ph, n, p, k, oc, moisture = row
-        text = f"Soil analysis for {village}, {district}: pH {ph}, Nitrogen {n}, Phosphorus {p}, Potassium {k}, Organic Carbon {oc}%, Soil Moisture {moisture}%"
+    # Soil health data (handle both reliable and fallback schemas)
+    for index, row in soil_df.iterrows():
+        doc_id = row.get('id', index)
+        district = row['district']
+        
+        if 'village' in row:
+            # Fallback schema
+            village = row['village']
+            pH = row['pH']
+            N = row.get('N', row.get('nitrogen', 0))
+            P = row.get('P', 0)
+            K = row.get('K', 0)
+            organic_carbon = row.get('organic_carbon', 0)
+            text = f"Soil analysis for {village}, {district}: pH {pH}, Nitrogen {N}, Phosphorus {P}, Potassium {K}, Organic Carbon {organic_carbon}%"
+        else:
+            # Reliable schema
+            pH = row['pH']
+            nitrogen = row.get('nitrogen', 0)
+            organic_carbon = row.get('organic_carbon', 0)
+            sand_percent = row.get('sand_percent', 0)
+            clay_percent = row.get('clay_percent', 0)
+            text = f"Soil analysis for {district}: pH {pH:.1f}, Nitrogen {nitrogen:.1f}%, Organic Carbon {organic_carbon:.1f}%, Sand {sand_percent}%, Clay {clay_percent}%"
+        
         documents.append(text)
         metadatas.append({
-            "source": "soil_card",
+            "source": row.get('source', 'soil_card'),
             "row_id": str(doc_id),
             "district": district,
-            "village": village,
             "type": "soil"
         })
         ids.append(f"soil_{doc_id}")
     
-    # Market prices data
-    cursor.execute("""
-        SELECT id, date, commodity, mandi, price 
-        FROM market_prices
-    """)
-    for row in cursor.fetchall():
-        doc_id, date, commodity, mandi, price = row
+    # Market prices data (handle both reliable and fallback schemas)
+    for index, row in market_df.iterrows():
+        doc_id = row.get('id', index)
+        date = row['date']
+        commodity = row['commodity']
+        mandi = row.get('mandi', 'Unknown Mandi')
+        price = row['price']
+        district = row.get('district', mandi.split()[0] if mandi else "unknown")
+        
         text = f"Market price for {commodity} at {mandi} on {date}: ₹{price} per unit"
         documents.append(text)
         metadatas.append({
-            "source": "market_prices",
+            "source": row.get('source', 'market_prices'),
             "row_id": str(doc_id),
-            "commodity": commodity,
-            "mandi": mandi,
+            "district": district,
             "date": date,
             "type": "market"
         })
         ids.append(f"market_{doc_id}")
     
     # eNAM trade data (if available)
+    cursor = conn.cursor()
     cursor.execute("""
         SELECT name FROM sqlite_master WHERE type='table' AND name='enam_trades';
     """)

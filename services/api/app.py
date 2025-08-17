@@ -53,6 +53,11 @@ collection = None
 sentence_model = None
 gemini_api_key = None
 
+# Safety gate configuration
+AUTHORITATIVE_SOURCES = {'weather_forecast', 'soil_card', 'market_prices', 'enam_trades', 'real_weather_data', 'real_mandi_prices'}
+MIN_PROVENANCE_SCORE = 0.6
+ACTIONABLE_KEYWORDS = ['irrigate', 'spray', 'apply', 'plant', 'harvest', 'fertilize', 'dose', 'timing']
+
 class QueryRequest(BaseModel):
     user_id: str
     question: str
@@ -65,6 +70,8 @@ class QueryResponse(BaseModel):
     provenance: List[Dict]
     escalate: Optional[bool] = False
     fallback_used: Optional[bool] = False
+    actionable: Optional[bool] = False
+    safety_gate: Optional[str] = None
 
 @app.on_event("startup")
 async def startup_event():
@@ -250,6 +257,78 @@ def retrieve_documents(query: str, k: int = 5, location: str = None) -> tuple:
         logger.error(f"Error retrieving documents: {e}")
         return [], [], 0.0
 
+def safety_gate_check(query: str, documents: List[str], metadatas: List[Dict], retrieval_score: float, llm_confidence: float) -> Dict:
+    """Safety gate to prevent harmful advice without proper provenance"""
+    
+    # Check if query contains actionable keywords
+    query_lower = query.lower()
+    is_actionable_query = any(keyword in query_lower for keyword in ACTIONABLE_KEYWORDS)
+    
+    if not is_actionable_query:
+        return {
+            "safe": True,
+            "actionable": False,
+            "gate_reason": None
+        }
+    
+    # Check provenance quality
+    has_authoritative_source = any(
+        meta.get('source', '') in AUTHORITATIVE_SOURCES 
+        for meta in metadatas
+    )
+    
+    # Check retrieval score threshold
+    meets_score_threshold = retrieval_score >= MIN_PROVENANCE_SCORE
+    
+    # Combined confidence check
+    combined_confidence = 0.6 * retrieval_score + 0.4 * llm_confidence
+    meets_confidence_threshold = combined_confidence >= 0.5
+    
+    # Safety gate decision
+    if has_authoritative_source and meets_score_threshold and meets_confidence_threshold:
+        return {
+            "safe": True,
+            "actionable": True,
+            "gate_reason": None
+        }
+    else:
+        reasons = []
+        if not has_authoritative_source:
+            reasons.append("no authoritative sources")
+        if not meets_score_threshold:
+            reasons.append(f"low retrieval score ({retrieval_score:.2f} < {MIN_PROVENANCE_SCORE})")
+        if not meets_confidence_threshold:
+            reasons.append(f"low combined confidence ({combined_confidence:.2f} < 0.5)")
+        
+        return {
+            "safe": False,
+            "actionable": True,
+            "gate_reason": "; ".join(reasons)
+        }
+
+def format_confidence_level(confidence: float) -> str:
+    """Convert numeric confidence to human-readable level"""
+    if confidence >= 0.8:
+        return "High"
+    elif confidence >= 0.5:
+        return "Medium"
+    else:
+        return "Low"
+
+def create_conservative_response(query: str, gate_reason: str) -> str:
+    """Create conservative response when safety gate blocks actionable advice"""
+    return f"""⚠️ **Insufficient authoritative data for actionable advice**
+
+Your question appears to require specific agricultural guidance, but the available data doesn't meet our safety standards ({gate_reason}).
+
+**Recommended actions:**
+• Consult your local agricultural extension officer
+• Visit the nearest Krishi Vigyan Kendra (KVK)
+• Contact district agricultural department
+• Speak with experienced farmers in your area
+
+**Why we're being cautious:** Agricultural advice can significantly impact crop yields and farmer livelihoods. We only provide actionable recommendations when backed by authoritative government data sources."""
+
 def log_llm_request(request_id: str, prompt: str, response: dict, status_code: int, latency: float, error: str = None):
     """Log LLM request for debugging and monitoring"""
     try:
@@ -346,8 +425,9 @@ def call_gemini_llm(prompt: str) -> tuple:
 async def ask_question(request: QueryRequest):
     """Main RAG endpoint for agricultural questions"""
     
-    # Safety check first
-    if safety_check(request.question):
+    # Safety check first - check for dangerous chemical/dosage queries
+    dangerous_keywords = ['pesticide', 'insecticide', 'fungicide', 'herbicide', 'chemical', 'spray', 'dose', 'dosage', 'poison']
+    if any(keyword in request.question.lower() for keyword in dangerous_keywords):
         return QueryResponse(
             answer="This question involves chemicals or dosages that require expert consultation. Please contact your local agricultural extension officer or Krishi Vigyan Kendra for safe recommendations.",
             confidence=1.0,
@@ -404,7 +484,26 @@ async def ask_question(request: QueryRequest):
         # Calculate combined confidence
         combined_confidence = 0.6 * retrieval_score + 0.4 * llm_confidence
         
-        # Check if we should escalate
+        # Apply safety gate
+        safety_check = safety_gate_check(request.question, documents, metadatas, retrieval_score, llm_confidence)
+        
+        if not safety_check["safe"]:
+            conservative_answer = create_conservative_response(request.question, safety_check["gate_reason"])
+            
+            return QueryResponse(
+                answer=conservative_answer,
+                confidence=combined_confidence,
+                provenance=[{
+                    "source": meta["source"],
+                    "row_id": meta["row_id"],
+                    "content": doc[:200] + "..." if len(doc) > 200 else doc
+                } for meta, doc in zip(metadatas[:3], documents[:3])],
+                escalate=True,
+                actionable=safety_check["actionable"],
+                safety_gate=safety_check["gate_reason"]
+            )
+        
+        # Check if we should escalate for other reasons
         should_escalate = combined_confidence < 0.4 or "ESCALATE" in llm_response
         
         if should_escalate:
@@ -416,24 +515,43 @@ async def ask_question(request: QueryRequest):
                 confidence=fallback_result["confidence"],
                 provenance=[],
                 escalate=True,
-                fallback_used=True
+                fallback_used=True,
+                actionable=safety_check["actionable"]
             )
         
-        # Build provenance
-        provenance = [
-            {
+        # Build enhanced provenance with URLs and dates
+        provenance = []
+        for meta, doc in zip(metadatas[:3], documents[:3]):
+            prov_entry = {
                 "source": meta["source"],
                 "row_id": meta["row_id"],
-                "content": doc[:200] + "..." if len(doc) > 200 else doc
+                "content": doc[:200] + "..." if len(doc) > 200 else doc,
+                "date": meta.get("date", "Unknown"),
+                "district": meta.get("district", "Unknown")
             }
-            for meta, doc in zip(metadatas[:3], documents[:3])  # Top 3 sources
-        ]
+            
+            # Add source URLs where available
+            source_urls = {
+                "weather_forecast": "https://mausam.imd.gov.in",
+                "soil_card": "https://soilhealth.dac.gov.in",
+                "market_prices": "https://agmarknet.gov.in",
+                "enam_trades": "https://enam.gov.in"
+            }
+            
+            if meta["source"] in source_urls:
+                prov_entry["url"] = source_urls[meta["source"]]
+            
+            provenance.append(prov_entry)
+        
+        # Enhanced response with safety metadata
+        enhanced_answer = f"{llm_response}\n\n**Sources:** {', '.join([p['source'] for p in provenance])}\n**Confidence:** {format_confidence_level(combined_confidence)}\n**Actionability:** {'Yes' if safety_check['actionable'] else 'No'}"
         
         return QueryResponse(
-            answer=llm_response,
+            answer=enhanced_answer,
             confidence=combined_confidence,
             provenance=provenance,
-            escalate=False
+            escalate=False,
+            actionable=safety_check["actionable"]
         )
         
     except Exception as e:
