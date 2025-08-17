@@ -1,25 +1,40 @@
 # 🌱 AgriSage API Setup Guide
 
-## Required API Keys (Free Tiers Available)
+This document outlines the API keys and configuration needed for AgriSage.
 
-### 1. OpenWeatherMap (Weather Data)
-- **URL**: https://openweathermap.org/api
-- **Free Tier**: 1,000 calls/day, 5-day forecast
-- **Setup**: 
-  1. Sign up at openweathermap.org
-  2. Get API key from dashboard
-  3. Add to `.env`: `OPENWEATHER_API_KEY=your_key_here`
+## Required API Keys
 
-### 2. NASA POWER (Agricultural Data) - Optional
-- **URL**: https://power.larc.nasa.gov/docs/
-- **Free Tier**: Unlimited (no key required for most endpoints)
-- **Data**: Temperature, precipitation, solar radiation, humidity
+### 1. Google Gemini API
+- **Purpose**: LLM for agricultural advice generation
+- **Get Key**: https://makersuite.google.com/app/apikey
+- **Environment Variable**: `GEMINI_API_KEY`
 
-### 3. SoilGrids ISRIC (Global Soil Data)
+### 2. OpenWeatherMap API
+- **Purpose**: Live weather forecasts (5-day)
+- **Get Key**: https://openweathermap.org/api
+- **Environment Variable**: `OPENWEATHER_API_KEY`
+- **Plan**: Free tier (1000 calls/day)
+
+### 3. Data.gov.in API
+- **Purpose**: Official mandi prices (reliable JSON API)
+- **Get Key**: https://data.gov.in/
+- **Environment Variable**: `DATA_GOV_IN_API_KEY=579b464db66ec23bdd00000172446d0ce22d44d87c77605498e730e8`
+- **Plan**: Free tier (register for API access)
+
+### 4. Twilio API (Optional - for SMS)
+- **Purpose**: SMS-based farmer queries
+- **Get Key**: https://console.twilio.com/
+- **Environment Variables**: 
+  - `TWILIO_ACCOUNT_SID`
+  - `TWILIO_AUTH_TOKEN`
+  - `TWILIO_PHONE_NUMBER`
+
+### 5. SoilGrids ISRIC (Global Soil Data)
 - **URL**: https://rest.isric.org/soilgrids/v2.0/docs
 - **Free Tier**: Unlimited (no key required)
 - **Data**: pH, nitrogen, organic carbon, sand/clay content
 
+### 6. Agmarknet (Indian Market Prices)
 ### 4. Agmarknet (Indian Market Prices)
 - **URL**: https://agmarknet.gov.in
 - **Free Tier**: CSV downloads available

@@ -205,7 +205,19 @@ class ReliableAPIFetcher:
         """Download Agmarknet CSV data"""
         market_data = []
         
-        # Try direct CSV download URLs (these change daily)
+        # Use the working scraper
+        try:
+            from .agmarknet_scraper import AgmarknetScraper
+            scraper = AgmarknetScraper(str(self.db_path))
+            scraped_data = scraper.scrape_daily_prices()
+            
+            if scraped_data:
+                logger.info(f"✅ Agmarknet scraper: {len(scraped_data)} records")
+                return scraped_data
+        except Exception as e:
+            logger.warning(f"Agmarknet scraper failed: {e}")
+        
+        # Fallback to CSV URLs
         csv_urls = [
             "https://agmarknet.gov.in/Others/profile.aspx?ss=1&mi=3",  # Daily prices
             "https://agmarknet.gov.in/SearchCmmMkt.aspx"  # Market search
