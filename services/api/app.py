@@ -19,8 +19,10 @@ from datetime import datetime
 import uuid
 import re
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from project root
+project_root = Path(__file__).parent.parent.parent
+dotenv_path = project_root / '.env'
+load_dotenv(dotenv_path=dotenv_path)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -110,7 +112,7 @@ def get_context_from_db(location: str = None) -> Dict:
     context = {}
     
     try:
-        db_path = Path("data/agri.db")
+        db_path = Path("data/agrisage.db")
         if not db_path.exists():
             return context
             
@@ -561,11 +563,30 @@ async def ask_question(request: QueryRequest):
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    db_records = 0
+    try:
+        db_path = Path("data/agrisage.db")
+        if db_path.exists():
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM reliable_weather")
+            weather_rows = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM reliable_soil")
+            soil_rows = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM reliable_markets")
+            market_rows = cursor.fetchone()[0]
+            db_records = weather_rows + soil_rows + market_rows
+            conn.close()
+    except Exception as e:
+        logger.error(f"Health check DB error: {e}")
+
     return {
         "status": "healthy",
         "chroma_connected": collection is not None,
         "model_loaded": sentence_model is not None,
-        "gemini_configured": bool(os.getenv("GEMINI_API_KEY"))
+        "gemini_configured": bool(os.getenv("GEMINI_API_KEY")),
+        "database_records": db_records,
+        "vector_documents": collection.count() if collection else 0
     }
 
 @app.post("/fallback")

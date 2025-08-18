@@ -92,53 +92,65 @@ class DataGovInAPIFetcher:
             'uttarakhand': ['Uttarakhand', 'UK']
         }
     
-    def fetch_mandi_prices(self, limit: int = 1000, days_back: int = 7) -> List[Dict]:
-        """Fetch mandi prices from data.gov.in API"""
+    def fetch_market_prices_for_state(self, primary_state: str, limit: int = 2000) -> List[Dict]:
+        """Fetch mandi prices, trying a primary state and then falling back to others."""
         if not self.api_key:
-            logger.warning("DATA_GOV_IN_API_KEY not found in environment")
+            logger.error("❌ DATA_GOV_IN_API_KEY not found in environment. Cannot fetch market data.")
             return []
-        
+
+        fallback_config = self.regional_fallback.get(primary_state.lower(), self.regional_fallback['uttarakhand'])
+        states_to_try = (
+            [primary_state] + 
+            fallback_config.get('immediate', []) + 
+            fallback_config.get('nearby', [])
+        )
+
         all_records = []
-        
-        try:
-            # Fetch recent mandi price data
-            url = f"https://api.data.gov.in/resource/{self.endpoints['mandi_prices']}"
-            params = {
-                'api-key': self.api_key,
-                'format': 'json',
-                'offset': 0,
-                'limit': limit
-            }
-            
-            logger.info(f"🌐 Fetching mandi prices from data.gov.in API...")
-            response = self.session.get(url, params=params, timeout=30)
-            
-            if response.status_code == 200:
-                data = response.json()
+        for state in states_to_try:
+            logger.info(f"🌐 Attempting to fetch market prices for {state}...")
+            try:
+                url = f"https://api.data.gov.in/resource/{self.endpoints['mandi_prices']}"
+                params = {
+                    'api-key': self.api_key,
+                    'format': 'json',
+                    'offset': 0,
+                    'limit': limit,
+                    f'filters[state]': state
+                }
                 
-                if 'records' in data:
+                response = self.session.get(url, params=params, timeout=45)
+                response.raise_for_status() # Will raise an HTTPError for bad responses (4xx or 5xx)
+
+                data = response.json()
+                if 'records' in data and data['records']:
                     records = data['records']
-                    logger.info(f"✅ Retrieved {len(records)} raw mandi records")
+                    logger.info(f"✅ Retrieved {len(records)} raw records for {state}.")
                     
-                    # Process and filter records
+                    processed_for_state = []
                     for record in records:
                         processed_record = self._process_mandi_record(record)
-                        if processed_record and self._is_relevant_record(processed_record):
-                            all_records.append(processed_record)
+                        if processed_record:
+                            processed_for_state.append(processed_record)
                     
-                    logger.info(f"🎯 Filtered to {len(all_records)} relevant records")
+                    if processed_for_state:
+                        logger.info(f"🎯 Processed {len(processed_for_state)} valid records for {state}. Stopping search.")
+                        all_records.extend(processed_for_state)
+                        return all_records # Success, so we stop and return the data
                 else:
-                    logger.warning("No 'records' field in API response")
-            
-            elif response.status_code == 401:
-                logger.error("❌ API key authentication failed")
-            elif response.status_code == 429:
-                logger.warning("⚠️ API rate limit exceeded")
-            else:
-                logger.error(f"❌ API request failed: {response.status_code}")
+                    logger.warning(f"⚠️ No market data records found for {state}. Trying next state.")
+
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 401:
+                    logger.error("❌ API key is invalid or expired. Aborting market data fetch.")
+                    return [] # Stop trying if key is bad
+                logger.error(f"❌ HTTP Error fetching data for {state}: {e}. Trying next state.")
+            except requests.exceptions.RequestException as e:
+                logger.error(f"❌ Request failed for {state}: {e}. Trying next state.")
+            except Exception as e:
+                logger.error(f"❌ An unexpected error occurred for {state}: {e}. Trying next state.")
         
-        except Exception as e:
-            logger.error(f"❌ Failed to fetch from data.gov.in API: {e}")
+        if not all_records:
+            logger.error(f"❌ All attempts to fetch market data failed for primary and fallback states.")
         
         return all_records
     

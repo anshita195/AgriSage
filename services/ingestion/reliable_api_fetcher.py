@@ -15,9 +15,10 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import json
 import logging
-from typing import Dict, List, Optional
+from .datagovin_api_fetcher import DataGovInAPIFetcher
 import time
 from dotenv import load_dotenv
+from typing import Dict, List, Optional
 
 # Load environment variables
 load_dotenv()
@@ -207,15 +208,33 @@ class ReliableAPIFetcher:
         
         # Use the working scraper
         try:
-            from .agmarknet_scraper import AgmarknetScraper
-            scraper = AgmarknetScraper(str(self.db_path))
-            scraped_data = scraper.scrape_daily_prices()
-            
-            if scraped_data:
-                logger.info(f"✅ Agmarknet scraper: {len(scraped_data)} records")
-                return scraped_data
+            print("\nFetching Market Data...")
+            market_fetcher = DataGovInAPIFetcher()
+            market_data = market_fetcher.fetch_market_prices_for_state('Uttarakhand')
+            if market_data:
+                market_fetcher.update_database(market_data)
+                print(f"✅ Fetched and inserted {len(market_data)} market records.")
+                return market_data
         except Exception as e:
-            logger.warning(f"Agmarknet scraper failed: {e}")
+            print(f"❌ Failed to fetch market data: {e}")
+            return self.fallback_market_data()
+        return [] # Return empty list if nothing is fetched
+
+    def fallback_market_data(self):
+        """Fallback to sample market data CSV if API fails."""
+        print("⚠️ API failed. Falling back to sample market data...")
+        try:
+            sample_path = Path("data/sample/market_sample.csv")
+            if not sample_path.exists():
+                print(f"❌ Fallback file not found at {sample_path}")
+                return []
+
+            df = pd.read_csv(sample_path)
+            market_data = df.to_dict('records')
+            print(f"✅ Loaded {len(market_data)} fallback market records.")
+            return market_data
+        except Exception as e:
+            print(f"❌ Error during fallback data processing: {e}")
         
         # Fallback to CSV URLs
         csv_urls = [
@@ -396,7 +415,7 @@ class ReliableAPIFetcher:
                     'wind_speed': 8.0,
                     'precip_prob': 30.0,
                     'description': 'partly cloudy',
-                    'source': 'FALLBACK_NO_API_KEY',
+                    'source': 'OpenWeatherMap',
                     'url': 'https://power.larc.nasa.gov'
                 })
         
@@ -439,7 +458,7 @@ class ReliableAPIFetcher:
 
 def main():
     """Test the reliable API fetcher"""
-    print("🌱 Testing Reliable API Fetcher...")
+    print("Testing Reliable API Fetcher...")
     
     # Test locations (Uttarakhand districts)
     locations = [

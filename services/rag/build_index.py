@@ -33,7 +33,7 @@ def load_data_from_db():
         print(f"⚠️ Using fallback soil data: {len(soil_df)} records")
     
     try:
-        market_df = pd.read_sql_query("SELECT * FROM reliable_markets", conn)
+        market_df = pd.read_sql_query("SELECT * FROM real_mandi_prices WHERE source = 'DataGovIn_API'", conn)
         print(f"✅ Using reliable market data: {len(market_df)} records")
     except:
         market_df = pd.read_sql_query("SELECT * FROM market_prices", conn)
